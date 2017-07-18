@@ -1,0 +1,241 @@
+#!/usr/bin/env python3
+
+"""\
+標準入力に与えられるメールに関するデータを取得し、Slackへ投稿する
+"""
+
+from argparse import ArgumentParser, RawDescriptionHelpFormatter
+import email.parser
+import json
+from logging import (
+    getLogger, Formatter, StreamHandler, NullHandler, INFO, DEBUG
+)
+from logging.handlers import SysLogHandler
+import platform
+import requests
+import sys
+import traceback
+
+__version__ = '0.1.0'
+
+
+def dump_email_header_to_logger(msg, logger, *, log_level=DEBUG, prefix=''):
+    logger.log(log_level, '{}Header:'.format(prefix))
+    keys = msg.keys()
+    # Received等重複するキーがある
+    for key in sorted(set(keys), key=keys.index):
+        lst = msg.get_all(key)
+        if len(lst) > 1:
+            logger.log(log_level, ('{}- {} ({} items):'
+                                   .format(prefix, key, len(lst))))
+            indent_size = len(str(len(lst) - 1))
+            for i, elem in enumerate(lst):
+                # 次のように表示される (例えばReceived ヘッダで使用される)
+                # - 1:
+                # - >>
+                # - >>
+                for j, line in enumerate(elem.split('\n')):
+                    if j == 0:
+                        s = '{}- {{:{}<}}: {{}}'.format(prefix, indent_size)
+                        logger.log(log_level, s.format(i, line.rstrip()))
+                    else:
+                        s = '{}. {} {{}}'.format(prefix,
+                                                 '>' * (indent_size + 1))
+                        logger.log(log_level, s.format(line.rstrip()))
+        else:
+            elem = lst[0]
+            lines = elem.split('\n')
+            if len(lines) > 1:
+                logger.log(log_level, '{}- {}:'.format(prefix, key))
+                for i, line in enumerate(lines):
+                    if i == 0:
+                        logger.log(log_level, '{}-- {}'.format(prefix,
+                                                               line.rstrip()))
+                    else:
+                        logger.log(log_level, '{}.. {}'.format(prefix,
+                                                               line.rstrip()))
+            else:
+                logger.log(log_level, '{}- {}: {}'.format(prefix,
+                                                          key, elem.rstrip()))
+
+
+def dump_email_body_to_logger(msg, logger,
+                              *,
+                              log_level=DEBUG,
+                              message_index='0',
+                              prefix='',
+                              indent_str='  '):
+    # 「charset」には二通りの意味があり得る。
+    #
+    # 1) quoted-printableやbase64に関するもの
+    # 2) 文字列のエンコーディングに関するもの (UTF-8等)
+    #
+    # msg.get_payload(decode=True)の「decode」は前者に関する処理で、
+    # 既存のメッセージを必要であればデコードして
+    # bytesに変換することを意味する。この際の「charset」は
+    # msg.get_charset()で得られるが、ここでは使用する必要がない
+    #
+    # 2)に関する処理はContent-Typeのパラメータから得られる
+    # 「charset」を使用する(e.g. 'text/html; charset=UTF-8' -> 'UTF-8')
+    #
+    encoding = msg.get_param('charset')
+    logger.log(log_level,
+               ('{}Message content {}'
+                ' (content_type: {}, params: {}, charset: {}, encoding: {}):'
+                .format(prefix,
+                        message_index,
+                        msg.get_content_type(),
+                        msg.get_params(),
+                        msg.get_charset(),
+                        encoding)))
+    if not encoding:
+        encoding = 'us-ascii'
+    if msg.preamble:
+        logger.log(log_level, '{}preample:'.format(prefix))
+        for line in msg.preamble.split('\n'):
+            logger.log(log_level, '{}> {}'.format(prefix, line.rstrip()))
+    if msg.is_multipart():
+        for i, sub_msg in enumerate(msg.get_payload()):
+            new_prefix = prefix + indent_str
+            new_message_index = '{}-{}'.format(message_index, i + 1)
+            dump_email_body_to_logger(sub_msg,
+                                      logger,
+                                      message_index=new_message_index,
+                                      log_level=log_level,
+                                      prefix=new_prefix)
+    else:
+        if msg.get_content_maintype() == 'text':
+            text = msg.get_payload(decode=True).decode(encoding)
+            for line in text.split('\n'):
+                logger.log(log_level, '{}> {}'.format(prefix, line.rstrip()))
+        else:
+            data = msg.get_payload(decode=True)
+            logger.log(log_level, '{}> (Possibly binary data with size {})'
+                       .format(prefix, len(data)))
+    if msg.epilogue:
+        logger.log(log_level, '{}epilogue:'.fromat(prefix))
+        for line in msg.epilogue.split('\n'):
+            logger.log(log_level, '{}> {}'.format(prefix, line.rstrip()))
+    if msg.defects:
+        logger.log(log_level, '{}defects:'.format(prefix))
+        for defect in msg.defects:
+            logger.log(log_level, '{}- {} (detail: {})'
+                       .format(prefix,
+                               defect.__class__.__name__,
+                               defect))
+
+
+def dump_email_to_logger(msg, logger,
+                         *,
+                         log_level=DEBUG,
+                         prefix='',
+                         indent_str='  '):
+    """\
+    msgのヘッダと本体をloggerに出力する。
+    マルチパートのメッセージではネストする毎に
+    indent_strがprefixに追加されながら再起的にこの関数が呼び出される
+    """
+    dump_email_header_to_logger(msg, logger,
+                                log_level=log_level, prefix=prefix)
+    dump_email_body_to_logger(msg, logger,
+                              log_level=log_level,
+                              message_index='0',
+                              prefix=prefix,
+                              indent_str=indent_str)
+
+
+def append_single_payload(content, msg):
+    encoding = msg.get_param('charset')
+    if (msg.get_content_maintype() == 'text'
+        and msg.get_content_subtype() == 'plain'):
+        text = msg.get_payload(decode=True).decode(encoding)
+        for line in text.split('\n'):
+            content.append(line.rstrip())
+    else:
+        data = msg.get_payload(decode=True)
+        content.append('({}: {} bytes)'
+                       .format(msg.get_content_type(), len(data)))
+
+
+def forward_to_slack(args, logger):
+    try:
+        # 標準入力をそのまま出力し、それをEmailメッセージとしてパーサに与える。
+        parser = email.parser.FeedParser()
+        logger.debug('stdin:')
+        for line in sys.stdin:
+            parser.feed(line)
+            logger.debug('>>> {}'.format(line.rstrip()))
+        msg = parser.close()
+        dump_email_to_logger(msg, logger, log_level=DEBUG)
+        content = ['Subject: {}'.format(msg.get('Subject', ''))]
+        if msg.is_multipart():
+            for i, sub_msg in enumerate(msg.get_payload()):
+                if i > 0:
+                    content.append('---')
+                append_single_payload(content, sub_msg)
+        else:
+            append_single_payload(content, msg)
+        payload = json.dumps({
+            'text': '\n'.join(content),
+        })
+        logger.debug('Sending payload "{}"'.format(payload))
+        r = requests.post(args.url, payload)
+        if r.status_code != 200:
+            logger.warning('Status code was {} != 200 ({})'
+                           .format(r.status_code, r.text))
+    except Exception as e:
+        logger.error('Exception raised during handling stdin ({}, {}'
+                     .format(e.__class__.__name__, e))
+        for line in traceback.format_exc().rstrip().split('\n'):
+            logger.error(line)
+        return 1
+    return 0
+
+
+def main():
+    parser = ArgumentParser(description=(__doc__),
+                            formatter_class=RawDescriptionHelpFormatter)
+    parser.add_argument('url')
+    parser.add_argument('-s', '--syslog', action='store_true')
+    parser.add_argument('-r', '--stream', action='store_true')
+    parser.add_argument('-e', '--encoding', default='UTF-8',
+                        help='Log encoding')
+    parser.add_argument('-d', '--debug', action='store_true',
+                        help='Show debug log')
+    parser.add_argument('-v', action='version',
+                        version='%(prog)s {}'.format(__version__))
+    args = parser.parse_args()
+    if args.debug:
+        log_level = DEBUG
+    else:
+        log_level = INFO
+    logger = getLogger(__name__)
+    logger.setLevel(log_level)
+    handlers = []
+
+    if args.syslog:
+        handler = SysLogHandler('/dev/log')
+        handler.setFormatter(Formatter('%(levelname)7s %(message)s'))
+        handlers.append(handler)
+    elif args.stream:
+        handler = StreamHandler()
+        handler.setFormatter(Formatter(
+            Formatter('%(asctime)s %(levelname)7s %(message)s')))
+        handlers.append(handler)
+
+    if not handlers:
+        handlers.append(NullHandler())
+
+    for handler in handlers:
+        logger.addHandler(handler)
+        handler.setLevel(log_level)
+
+    logger.info('Start running (version: {} with Python {})'
+                .format(__version__, platform.python_version()))
+    exit_status = forward_to_slack(args, logger)
+    logger.info('Finished running with exit status ({})'.format(exit_status))
+    return exit_status
+
+
+if __name__ == '__main__':
+    sys.exit(main())
