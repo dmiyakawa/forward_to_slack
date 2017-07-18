@@ -8,7 +8,7 @@ from argparse import ArgumentParser, RawDescriptionHelpFormatter
 import email.parser
 import json
 from logging import (
-    getLogger, Formatter, StreamHandler, NullHandler, INFO, DEBUG
+    getLogger, Formatter, StreamHandler, NullHandler, INFO, DEBUG, WARNING
 )
 from logging.handlers import SysLogHandler
 import platform
@@ -144,8 +144,7 @@ def dump_email_to_logger(msg, logger,
                               indent_str=indent_str)
 
 
-def append_single_payload(content, msg):
-    encoding = msg.get_param('charset')
+def append_single_payload(content, msg, encoding):
     if (msg.get_content_maintype() == 'text'
         and msg.get_content_subtype() == 'plain'):
         text = msg.get_payload(decode=True).decode(encoding)
@@ -167,14 +166,17 @@ def forward_to_slack(args, logger):
             logger.debug('>>> {}'.format(line.rstrip()))
         msg = parser.close()
         dump_email_to_logger(msg, logger, log_level=DEBUG)
+
+        encoding = msg.get_param('charset', 'us-ascii')
+        logger.debug('Using charset "{}"'.format(encoding))
         content = ['Subject: {}'.format(msg.get('Subject', ''))]
         if msg.is_multipart():
             for i, sub_msg in enumerate(msg.get_payload()):
                 if i > 0:
                     content.append('---')
-                append_single_payload(content, sub_msg)
+                append_single_payload(content, sub_msg, encoding)
         else:
-            append_single_payload(content, msg)
+            append_single_payload(content, msg, encoding)
         payload = json.dumps({
             'text': '\n'.join(content),
         })
@@ -202,11 +204,15 @@ def main():
                         help='Log encoding')
     parser.add_argument('-d', '--debug', action='store_true',
                         help='Show debug log')
+    parser.add_argument('-w', '--warning', action='store_true',
+                        help='Show warning/error log only')
     parser.add_argument('-v', action='version',
                         version='%(prog)s {}'.format(__version__))
     args = parser.parse_args()
     if args.debug:
         log_level = DEBUG
+    elif args.warning:
+        log_level = WARNING
     else:
         log_level = INFO
     logger = getLogger(__name__)
